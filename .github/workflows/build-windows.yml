@@ -26,21 +26,20 @@ jobs:
             make
             mingw-w64-x86_64-gcc
 
-      # Only the two submodules the core needs; the data/ ones are for the full gn build.
       - name: Fetch submodules
         run: git submodule update --init --depth 1 src/libretro src/quickjs-ng
 
-      # MinGW has no libdl, so drop -ldl for the Windows build.
       - name: Patch Makefile.common
         run: sed -i 's/-lpthread -ldl/-lpthread/' Makefile.common
 
       - name: Build
-        run: make platform=win -j"$(nproc)"
+        run: make platform=win LIBS="-static" -j"$(nproc)"
 
       - name: Check output
         run: |
           ls -la puzzlescript_libretro.dll
           file puzzlescript_libretro.dll
+          objdump -p puzzlescript_libretro.dll | grep "DLL Name"
 
       - uses: actions/upload-artifact@v4
         with:
