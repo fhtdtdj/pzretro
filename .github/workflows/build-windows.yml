@@ -1,0 +1,50 @@
+name: Build Windows core
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/build-windows.yml"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git
+            make
+            mingw-w64-x86_64-gcc
+
+      # Only the two submodules the core needs; the data/ ones are for the full gn build.
+      - name: Fetch submodules
+        run: git submodule update --init --depth 1 src/libretro src/quickjs-ng
+
+      # MinGW has no libdl, so drop -ldl for the Windows build.
+      - name: Patch Makefile.common
+        run: sed -i 's/-lpthread -ldl/-lpthread/' Makefile.common
+
+      - name: Build
+        run: make platform=win -j"$(nproc)"
+
+      - name: Check output
+        run: |
+          ls -la puzzlescript_libretro.dll
+          file puzzlescript_libretro.dll
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: puzzlescript-libretro-windows-x64
+          path: |
+            puzzlescript_libretro.dll
+            puzzlescript_libretro.info
