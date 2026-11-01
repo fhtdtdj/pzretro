@@ -5,6 +5,7 @@ name: Build Windows core
 #  - a rendering fix: the CSS color "transparent" is skipped instead of drawn as black
 #    (fixes the black squares where the player and crates should be)
 #  - working save states for big games: 4 MB state limit and fast loading
+#  - speed: native C++ versions of the engine's hot loops (about 15x faster moves on big games)
 
 on:
   workflow_dispatch:
@@ -71,6 +72,11 @@ jobs:
                contains its result. (On Enigmash loading a state drops from ~17 s to ~0.5 s.)
             6. Raises the maximum save-state size from 1 MB to 4 MB in src/core.cpp. Enigmash's
                state is about 3 MB, so with the stock 1 MB limit saving it fails.
+            7. Speed: adds src/native_rules.cpp (C++ versions of the engine's hot loops: rule matching and
+               application, row/column masks, player search, movement resolution) and hooks them into the
+               engine from data/custom/overload.js. Anything the native code cannot handle (ellipsis,
+               rigid and random rules) still runs in the original JS, on the same data. Also switches the
+               engine's verbose debug logging off.
           """
           import re
           import sys
@@ -249,6 +255,661 @@ jobs:
                                "SERIALIZE_MAX_SIZE")
               open(COREPP, "w", encoding="utf-8", newline="").write(c)
               print("  core.cpp: save-state limit raised to 4 MB")
+
+          # ---- 7. native fast paths -------------------------------------------------------------------
+          NATIVE_CPP = r'''// Native implementation of PuzzleScript's Rule.tryApply() for the common rule shapes.
+          // The JS engine stays the source of truth: rules this code cannot handle (ellipsis, rigid,
+          // random replacements) are left to the original JS implementation by the caller.
+          #include <cstdint>
+          #include <cstring>
+          #include <cstdio>
+          #include <vector>
+
+          #include "quickjs.h"
+
+          namespace nativerules {
+
+          struct Cell {
+              bool hasRepl{false};
+              std::vector<int32_t> op, om, mp, mm;
+              std::vector<std::vector<int32_t>> any;
+              std::vector<int32_t> clr, set, mclr, mset;
+          };
+
+          struct Row {
+              int len{0};
+              std::vector<int32_t> mask, maskM;
+              std::vector<Cell> cells;
+          };
+
+          struct Rule {
+              int dir{0};
+              bool hasRepl{false};
+              bool isGlobal{false};
+              std::vector<int32_t> ruleMask;
+              std::vector<Row> rows;
+          };
+
+          static std::vector<Rule> rules;
+
+          struct Level {
+              int32_t *obj{nullptr}, *mov{nullptr};
+              int w{0}, h{0}, so{0}, sm{0};
+              int32_t *mapO{nullptr}, *mapM{nullptr};
+              std::vector<int32_t *> rowO, rowM, colO, colM;
+              int32_t *sfxC{nullptr}, *sfxD{nullptr};
+              int radius{-1};      // -1: no local_radius
+              int player{-1};      // playerPositions[0], -1 if none
+          } L;
+
+          static int32_t *ta(JSContext *ctx, JSValueConst v, size_t *count)
+          {
+              size_t off{0}, len{0}, bpe{0};
+              JSValue ab = JS_GetTypedArrayBuffer(ctx, v, &off, &len, &bpe);
+              if (JS_IsException(ab)) {
+                  return nullptr;
+              }
+              size_t sz{0};
+              uint8_t *p = JS_GetArrayBuffer(ctx, &sz, ab);
+              JS_FreeValue(ctx, ab);
+              if (!p || bpe != 4) {
+                  return nullptr;
+              }
+              *count = len / 4;
+              return reinterpret_cast<int32_t *>(p + off);
+          }
+
+          static int32_t *ta_at(JSContext *ctx, JSValueConst arr, uint32_t i)
+          {
+              JSValue e = JS_GetPropertyUint32(ctx, arr, i);
+              size_t n{0};
+              int32_t *p = ta(ctx, e, &n);
+              JS_FreeValue(ctx, e);
+              return p;
+          }
+
+          // native_rule_compile(prog Int32Array) -> handle or -1
+          static JSValue js_compile(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv)
+          {
+              size_t n{0};
+              int32_t *p = argc > 0 ? ta(ctx, argv[0], &n) : nullptr;
+              if (!p) {
+                  return JS_NewInt32(ctx, -1);
+              }
+              size_t pos{0};
+              auto next = [&]() -> int32_t { return pos < n ? p[pos++] : 0; };
+              auto vec = [&](int cnt) {
+                  std::vector<int32_t> v(cnt);
+                  for (int i = 0; i < cnt; ++i) {
+                      v[i] = next();
+                  }
+                  return v;
+              };
+              Rule r;
+              r.dir = next();
+              r.hasRepl = next() != 0;
+              r.isGlobal = next() != 0;
+              int nrows = next();
+              int so = next();
+              int sm = next();
+              r.ruleMask = vec(so);
+              for (int i = 0; i < nrows; ++i) {
+                  Row row;
+                  row.len = next();
+                  row.mask = vec(so);
+                  row.maskM = vec(sm);
+                  for (int k = 0; k < row.len; ++k) {
+                      Cell c;
+                      c.hasRepl = next() != 0;
+                      c.op = vec(so);
+                      c.om = vec(so);
+                      c.mp = vec(sm);
+                      c.mm = vec(sm);
+                      int nany = next();
+                      for (int a = 0; a < nany; ++a) {
+                          c.any.push_back(vec(so));
+                      }
+                      if (c.hasRepl) {
+                          c.clr = vec(so);
+                          c.set = vec(so);
+                          c.mclr = vec(sm);
+                          c.mset = vec(sm);
+                      }
+                      row.cells.push_back(std::move(c));
+                  }
+                  r.rows.push_back(std::move(row));
+              }
+              if (pos > n) {
+                  return JS_NewInt32(ctx, -1);
+              }
+              rules.push_back(std::move(r));
+              return JS_NewInt32(ctx, (int)rules.size() - 1);
+          }
+
+          // native_bind_level(objects, movements, width, height, SO, SM, mapO, mapM, rowO[], rowM[], colO[], colM[],
+          //                   sfxCreate, sfxDestroy, localRadius(-1 none), player0(-1 none))
+          static JSValue js_bind(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv)
+          {
+              if (argc < 16) {
+                  return JS_ThrowTypeError(ctx, "native_bind_level: bad arguments");
+              }
+              size_t c{0};
+              L.obj = ta(ctx, argv[0], &c);
+              L.mov = ta(ctx, argv[1], &c);
+              JS_ToInt32(ctx, &L.w, argv[2]);
+              JS_ToInt32(ctx, &L.h, argv[3]);
+              JS_ToInt32(ctx, &L.so, argv[4]);
+              JS_ToInt32(ctx, &L.sm, argv[5]);
+              L.mapO = ta(ctx, argv[6], &c);
+              L.mapM = ta(ctx, argv[7], &c);
+              L.rowO.assign(L.h, nullptr);
+              L.rowM.assign(L.h, nullptr);
+              L.colO.assign(L.w, nullptr);
+              L.colM.assign(L.w, nullptr);
+              for (int j = 0; j < L.h; ++j) {
+                  L.rowO[j] = ta_at(ctx, argv[8], j);
+                  L.rowM[j] = ta_at(ctx, argv[9], j);
+              }
+              for (int i = 0; i < L.w; ++i) {
+                  L.colO[i] = ta_at(ctx, argv[10], i);
+                  L.colM[i] = ta_at(ctx, argv[11], i);
+              }
+              L.sfxC = ta(ctx, argv[12], &c);
+              L.sfxD = ta(ctx, argv[13], &c);
+              JS_ToInt32(ctx, &L.radius, argv[14]);
+              JS_ToInt32(ctx, &L.player, argv[15]);
+              void *dbg_obj = L.obj;
+              bool ok = L.so <= 64 && L.sm <= 64 && L.obj && L.mov && L.mapO && L.mapM && L.sfxC && L.sfxD;
+              for (auto *q : L.rowO) ok = ok && q;
+              for (auto *q : L.rowM) ok = ok && q;
+              for (auto *q : L.colO) ok = ok && q;
+              for (auto *q : L.colM) ok = ok && q;
+              if (!ok) {
+                  char msg[200];
+                  snprintf(msg, sizeof msg, "native_bind_level: bad arrays so=%d sm=%d obj=%p mov=%p mapO=%p mapM=%p sfxC=%p sfxD=%p", L.so, L.sm, (void *)dbg_obj, (void *)L.mov, (void *)L.mapO, (void *)L.mapM, (void *)L.sfxC, (void *)L.sfxD);
+                  L.obj = nullptr;
+                  return JS_ThrowTypeError(ctx, "%s", msg);
+              }
+              return JS_UNDEFINED;
+          }
+
+          static inline bool subset(const std::vector<int32_t> &a, const int32_t *b)
+          {
+              for (size_t i = 0; i < a.size(); ++i) {
+                  if ((a[i] & b[i]) != a[i]) {
+                      return false;
+                  }
+              }
+              return true;
+          }
+
+          static inline bool cell_matches(const Cell &c, int idx)
+          {
+              const int32_t *co = L.obj + (size_t)idx * L.so;
+              const int32_t *cm = L.mov + (size_t)idx * L.sm;
+              for (int i = 0; i < L.so; ++i) {
+                  if ((co[i] & c.op[i]) != c.op[i]) return false;
+                  if (co[i] & c.om[i]) return false;
+              }
+              for (int i = 0; i < L.sm; ++i) {
+                  if ((cm[i] & c.mp[i]) != c.mp[i]) return false;
+                  if (cm[i] & c.mm[i]) return false;
+              }
+              for (const auto &a : c.any) {
+                  int32_t acc = 0;
+                  for (int i = 0; i < L.so; ++i) {
+                      acc |= co[i] & a[i];
+                  }
+                  if (!acc) return false;
+              }
+              return true;
+          }
+
+          static inline bool row_matches(const Row &row, int i, int d)
+          {
+              for (int k = 0; k < row.len; ++k) {
+                  if (!cell_matches(row.cells[k], i + k * d)) return false;
+              }
+              return true;
+          }
+
+          static void match_row(const Rule &r, const Row &row, int d, std::vector<int> &out)
+          {
+              out.clear();
+              if (!subset(row.mask, L.mapO) || !subset(row.maskM, L.mapM)) {
+                  return;
+              }
+              int xmin, xmax, ymin, ymax;
+              if (r.isGlobal || L.radius < 0) {
+                  xmin = 0; xmax = L.w; ymin = 0; ymax = L.h;
+              } else {
+                  if (L.player < 0) {
+                      return; // playerPositions[0] is undefined in JS: every comparison is false
+                  }
+                  int px = L.player / L.h, py = L.player % L.h;
+                  xmin = px - L.radius < 0 ? 0 : px - L.radius;
+                  xmax = px + L.radius + 1 > L.w ? L.w : px + L.radius + 1;
+                  ymin = py - L.radius < 0 ? 0 : py - L.radius;
+                  ymax = py + L.radius + 1 > L.h ? L.h : py + L.radius + 1;
+              }
+              switch (r.dir) {
+              case 1: ymin += row.len - 1; break;
+              case 2: ymax -= row.len - 1; break;
+              case 4: xmin += row.len - 1; break;
+              case 8: xmax -= row.len - 1; break;
+              }
+              if (r.dir > 2) {
+                  for (int y = ymin; y < ymax; ++y) {
+                      if (!subset(row.mask, L.rowO[y]) || !subset(row.maskM, L.rowM[y])) continue;
+                      for (int x = xmin; x < xmax; ++x) {
+                          int i = x * L.h + y;
+                          if (row_matches(row, i, d)) out.push_back(i);
+                      }
+                  }
+              } else {
+                  for (int x = xmin; x < xmax; ++x) {
+                      if (!subset(row.mask, L.colO[x]) || !subset(row.maskM, L.colM[x])) continue;
+                      for (int y = ymin; y < ymax; ++y) {
+                          int i = x * L.h + y;
+                          if (row_matches(row, i, d)) out.push_back(i);
+                      }
+                  }
+              }
+          }
+
+          static bool replace_cell(const Cell &c, int idx)
+          {
+              if (!c.hasRepl) return false;
+              int32_t *co = L.obj + (size_t)idx * L.so;
+              int32_t *cm = L.mov + (size_t)idx * L.sm;
+              int32_t newo[64], newm[64];
+              bool changed = false;
+              for (int i = 0; i < L.so; ++i) {
+                  newo[i] = (co[i] & ~c.clr[i]) | c.set[i];
+                  if (newo[i] != co[i]) changed = true;
+              }
+              for (int i = 0; i < L.sm; ++i) {
+                  newm[i] = (cm[i] & ~c.mclr[i]) | c.mset[i];
+                  if (newm[i] != cm[i]) changed = true;
+              }
+              if (!changed) return false;
+              for (int i = 0; i < L.so; ++i) {
+                  L.sfxC[i] |= newo[i] & ~co[i];
+                  L.sfxD[i] |= co[i] & ~newo[i];
+                  co[i] = newo[i];
+              }
+              for (int i = 0; i < L.sm; ++i) {
+                  cm[i] = newm[i];
+              }
+              int col = idx / L.h, rw = idx % L.h;
+              for (int i = 0; i < L.so; ++i) {
+                  L.colO[col][i] |= newo[i];
+                  L.rowO[rw][i] |= newo[i];
+                  L.mapO[i] |= newo[i];
+              }
+              for (int i = 0; i < L.sm; ++i) {
+                  L.colM[col][i] |= newm[i];
+                  L.rowM[rw][i] |= newm[i];
+                  L.mapM[i] |= newm[i];
+              }
+              return true;
+          }
+
+          // native_try_apply(handle) -> 0 no matches, 1 matched but nothing changed, 2 changed something
+          static JSValue js_try_apply(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv)
+          {
+              int32_t hnd{-1};
+              if (argc < 1 || JS_ToInt32(ctx, &hnd, argv[0]) || hnd < 0 || hnd >= (int)rules.size() || !L.obj) {
+                  return JS_ThrowTypeError(ctx, "native_try_apply: bad arguments");
+              }
+              const Rule &r = rules[hnd];
+              if (!subset(r.ruleMask, L.mapO)) {
+                  return JS_NewInt32(ctx, 0);
+              }
+              int d = 0;
+              switch (r.dir) {
+              case 1: d = -1; break;
+              case 2: d = 1; break;
+              case 4: d = -L.h; break;
+              case 8: d = L.h; break;
+              }
+              static std::vector<std::vector<int>> matches;
+              matches.resize(r.rows.size());
+              for (size_t i = 0; i < r.rows.size(); ++i) {
+                  match_row(r, r.rows[i], d, matches[i]);
+                  if (matches[i].empty()) {
+                      return JS_NewInt32(ctx, 0);
+                  }
+              }
+              if (!r.hasRepl) {
+                  return JS_NewInt32(ctx, 1);
+              }
+              // Tuples in the same order as the JS generateTuples(): the first row's match varies fastest.
+              size_t nrows = r.rows.size();
+              std::vector<size_t> ix(nrows, 0);
+              std::vector<int> tup(nrows);
+              bool result = false;
+              for (size_t t = 0;; ++t) {
+                  for (size_t i = 0; i < nrows; ++i) tup[i] = matches[i][ix[i]];
+                  bool ok = true;
+                  if (t > 0) {
+                      for (size_t i = 0; i < nrows && ok; ++i) {
+                          ok = row_matches(r.rows[i], tup[i], d);
+                      }
+                  }
+                  if (ok) {
+                      for (size_t i = 0; i < nrows; ++i) {
+                          int cur = tup[i];
+                          for (int k = 0; k < r.rows[i].len; ++k, cur += d) {
+                              if (replace_cell(r.rows[i].cells[k], cur)) result = true;
+                          }
+                      }
+                  }
+                  size_t i = 0;
+                  for (; i < nrows; ++i) {
+                      if (++ix[i] < matches[i].size()) break;
+                      ix[i] = 0;
+                  }
+                  if (i == nrows) break;
+              }
+              return JS_NewInt32(ctx, result ? 2 : 1);
+          }
+
+          // native_player_positions(objects, n_tiles, strideObj, playerMaskData) -> [tile indices]
+          static JSValue js_player_positions(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv)
+          {
+              size_t no{0}, nm{0};
+              int32_t *obj = argc > 3 ? ta(ctx, argv[0], &no) : nullptr;
+              int32_t *mask = argc > 3 ? ta(ctx, argv[3], &nm) : nullptr;
+              int32_t n{0}, stride{0};
+              if (argc > 3) {
+                  JS_ToInt32(ctx, &n, argv[1]);
+                  JS_ToInt32(ctx, &stride, argv[2]);
+              }
+              if (!obj || !mask || n < 0 || stride < 1 || (size_t)n * stride > no || (size_t)stride > nm) {
+                  return JS_ThrowTypeError(ctx, "native_player_positions: bad arguments");
+              }
+              JSValue result = JS_NewArray(ctx);
+              uint32_t k{0};
+              for (int32_t i = 0; i < n; ++i) {
+                  const int32_t *cell = obj + (size_t)i * stride;
+                  for (int32_t j = 0; j < stride; ++j) {
+                      if (cell[j] & mask[j]) {
+                          JS_SetPropertyUint32(ctx, result, k++, JS_NewInt32(ctx, i));
+                          break;
+                      }
+                  }
+              }
+              return result;
+          }
+
+          // native_calc_masks(): same result as the engine's calculateRowColMasks() for the bound level.
+          static JSValue js_calc_masks(JSContext *ctx, JSValueConst, int, JSValueConst *)
+          {
+              if (!L.obj) {
+                  return JS_ThrowTypeError(ctx, "native_calc_masks: not bound");
+              }
+              const int w = L.w, h = L.h, so = L.so, sm = L.sm;
+              for (int k = 0; k < so; ++k) L.mapO[k] = 0;
+              for (int k = 0; k < sm; ++k) L.mapM[k] = 0;
+              for (int j = 0; j < h; ++j) {
+                  for (int k = 0; k < so; ++k) L.rowO[j][k] = 0;
+                  for (int k = 0; k < sm; ++k) L.rowM[j][k] = 0;
+              }
+              for (int i = 0; i < w; ++i) {
+                  for (int k = 0; k < so; ++k) L.colO[i][k] = 0;
+                  for (int k = 0; k < sm; ++k) L.colM[i][k] = 0;
+              }
+              for (int i = 0; i < w; ++i) {
+                  for (int j = 0; j < h; ++j) {
+                      const size_t idx = (size_t)j + (size_t)i * h;
+                      const int32_t *co = L.obj + idx * so;
+                      const int32_t *cm = L.mov + idx * sm;
+                      for (int k = 0; k < so; ++k) {
+                          L.mapO[k] |= co[k];
+                          L.rowO[j][k] |= co[k];
+                          L.colO[i][k] |= co[k];
+                      }
+                      for (int k = 0; k < sm; ++k) {
+                          L.mapM[k] |= cm[k];
+                          L.rowM[j][k] |= cm[k];
+                          L.colM[i][k] |= cm[k];
+                      }
+                  }
+              }
+              return JS_UNDEFINED;
+          }
+
+          // native_nonzero_tiles(movements, n_tiles, strideMov) -> [tile indices whose movement words are not all zero]
+          static JSValue js_nonzero(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv)
+          {
+              size_t cnt{0};
+              int32_t *mv = argc > 2 ? ta(ctx, argv[0], &cnt) : nullptr;
+              int32_t n{0}, sm{0};
+              if (argc > 2) {
+                  JS_ToInt32(ctx, &n, argv[1]);
+                  JS_ToInt32(ctx, &sm, argv[2]);
+              }
+              if (!mv || n < 0 || sm < 1 || (size_t)n * sm > cnt) {
+                  return JS_ThrowTypeError(ctx, "native_nonzero_tiles: bad arguments");
+              }
+              JSValue result = JS_NewArray(ctx);
+              uint32_t k{0};
+              for (int32_t i = 0; i < n; ++i) {
+                  const int32_t *c = mv + (size_t)i * sm;
+                  for (int32_t j = 0; j < sm; ++j) {
+                      if (c[j]) {
+                          JS_SetPropertyUint32(ctx, result, k++, JS_NewInt32(ctx, i));
+                          break;
+                      }
+                  }
+              }
+              return result;
+          }
+
+          void register_functions(JSContext *ctx, JSValue global_obj)
+          {
+              JS_SetPropertyStr(ctx, global_obj, "native_rule_compile", JS_NewCFunction(ctx, js_compile, "native_rule_compile", 1));
+              JS_SetPropertyStr(ctx, global_obj, "native_bind_level", JS_NewCFunction(ctx, js_bind, "native_bind_level", 16));
+              JS_SetPropertyStr(ctx, global_obj, "native_player_positions", JS_NewCFunction(ctx, js_player_positions, "native_player_positions", 4));
+              JS_SetPropertyStr(ctx, global_obj, "native_calc_masks", JS_NewCFunction(ctx, js_calc_masks, "native_calc_masks", 0));
+              JS_SetPropertyStr(ctx, global_obj, "native_nonzero_tiles", JS_NewCFunction(ctx, js_nonzero, "native_nonzero_tiles", 3));
+              JS_SetPropertyStr(ctx, global_obj, "native_try_apply", JS_NewCFunction(ctx, js_try_apply, "native_try_apply", 1));
+          }
+
+          } // namespace nativerules
+          '''
+
+          NATIVE_JS = r'''
+          // ---- native rule engine fast path --------------------------------------------------------------
+          // Rules the native code cannot handle (ellipsis, rigid, random replacements) keep using the
+          // original JS implementation, which works on the same typed arrays.
+          // Only for the PuzzleScript Plus engine (the stock engine has a different Rule/level layout).
+          if (typeof native_rule_compile === 'function' && !globalThis.pzNativeOff &&
+              typeof Rule === 'function' && Rule.toString().indexOf('cellRowMasks_Movements') >= 0 &&
+              String(resolveMovements).indexOf('rigidMovementAppliedMask') >= 0 &&
+              typeof calculateRowColMasks === 'function' && typeof getPlayerPositions === 'function') {
+              (function () {
+                  var origTryApply = Rule.prototype.tryApply;
+                  var origApplyRules = applyRules;
+
+                  function nativeProgram(rule) {
+                      if (rule.isRigid || rule.isRandom) return null;
+                      if (!(rule.direction === 1 || rule.direction === 2 || rule.direction === 4 || rule.direction === 8)) return null;
+                      if (STRIDE_OBJ > 64 || STRIDE_MOV > 64) return null;
+                      var prog = [rule.direction, rule.hasReplacements ? 1 : 0, rule.isGlobal ? 1 : 0,
+                                  rule.patterns.length, STRIDE_OBJ, STRIDE_MOV];
+                      function push(vec, n) {
+                          for (var i = 0; i < n; i++) prog.push(vec.data[i] | 0);
+                      }
+                      push(rule.ruleMask, STRIDE_OBJ);
+                      for (var r = 0; r < rule.patterns.length; r++) {
+                          if (rule.isEllipsis[r]) return null;
+                          var row = rule.patterns[r];
+                          prog.push(row.length);
+                          push(rule.cellRowMasks[r], STRIDE_OBJ);
+                          push(rule.cellRowMasks_Movements[r], STRIDE_MOV);
+                          for (var k = 0; k < row.length; k++) {
+                              var c = row[k];
+                              if (c === ellipsisPattern || !(c instanceof CellPattern)) return null;
+                              var rep = c.replacement;
+                              if (rep && rule.hasReplacements) {
+                                  if (!rep.randomEntityMask.iszero() || !rep.randomDirMask.iszero()) return null;
+                              }
+                              var useRep = !!(rep && rule.hasReplacements);
+                              prog.push(useRep ? 1 : 0);
+                              push(c.objectsPresent, STRIDE_OBJ);
+                              push(c.objectsMissing, STRIDE_OBJ);
+                              push(c.movementsPresent, STRIDE_MOV);
+                              push(c.movementsMissing, STRIDE_MOV);
+                              prog.push(c.anyObjectsPresent.length);
+                              for (var a = 0; a < c.anyObjectsPresent.length; a++) push(c.anyObjectsPresent[a], STRIDE_OBJ);
+                              if (useRep) {
+                                  push(rep.objectsClear, STRIDE_OBJ);
+                                  push(rep.objectsSet, STRIDE_OBJ);
+                                  for (var i = 0; i < STRIDE_MOV; i++) prog.push((rep.movementsClear.data[i] | rep.movementsLayerMask.data[i]) | 0);
+                                  push(rep.movementsSet, STRIDE_MOV);
+                              }
+                          }
+                      }
+                      return new Int32Array(prog);
+                  }
+
+                  Rule.prototype.tryApply = function (lvl) {
+                      var h = this._nat;
+                      if (h === undefined) {
+                          var prog = null;
+                          try { prog = nativeProgram(this); } catch (e) { prog = null; }
+                          h = this._nat = prog ? native_rule_compile(prog) : -1;
+                      }
+                      if (h < 0) return origTryApply.call(this, lvl);
+                      var r = native_try_apply(h);
+                      if (r > 0) this.queueCommands();
+                      return r === 2;
+                  };
+
+                  var cache = null;
+                  function bindAll(playerPos0, radius) {
+                      if (cache === null || cache.row !== level.rowCellContents || cache.col !== level.colCellContents) {
+                          cache = {
+                              row: level.rowCellContents,
+                              col: level.colCellContents,
+                              rc: level.rowCellContents.map(function (b) { return b.data; }),
+                              rm: level.rowCellContents_Movements.map(function (b) { return b.data; }),
+                              cc: level.colCellContents.map(function (b) { return b.data; }),
+                              cm: level.colCellContents_Movements.map(function (b) { return b.data; })
+                          };
+                      }
+                      native_bind_level(level.objects, level.movements, level.width, level.height, STRIDE_OBJ, STRIDE_MOV,
+                          level.mapCellContents.data, level.mapCellContents_Movements.data,
+                          cache.rc, cache.rm, cache.cc, cache.cm,
+                          sfxCreateMask.data, sfxDestroyMask.data, radius, playerPos0);
+                  }
+
+                  // Plain scans over every tile: far cheaper in C++.
+                  calculateRowColMasks = function () {
+                      bindAll(-1, -1);
+                      native_calc_masks();
+                  };
+                  getPlayerPositions = function () {
+                      return native_player_positions(level.objects, level.n_tiles, STRIDE_OBJ, state.playerMask.data);
+                  };
+
+
+                  // resolveMovements: only tiles that actually have a pending movement need any work; the
+                  // original visits all of them (and clears every tile) in slow interpreted loops.
+                  resolveMovements = function (lvl, bannedGroup, shouldRecordMovement) {
+                      if (shouldRecordMovement === undefined) shouldRecordMovement = false;
+                      var n = lvl.n_tiles;
+                      var list = native_nonzero_tiles(lvl.movements, n, STRIDE_MOV);
+                      var moved = true;
+                      while (moved) {
+                          moved = false;
+                          for (var q = 0; q < list.length; q++) {
+                              moved = repositionEntitiesAtCell(list[q], shouldRecordMovement) || moved;
+                          }
+                      }
+                      var doUndo = false;
+                      for (var q = 0; q < list.length; q++) {
+                          var i = list[q];
+                          var cellMask = lvl.getCellInto(i, _o6);
+                          var movementMask = lvl.getMovements(i);
+                          if (!movementMask.iszero()) {
+                              var rigidMovementAppliedMask = lvl.rigidMovementAppliedMask[i];
+                              if (rigidMovementAppliedMask !== 0) {
+                                  movementMask.iand(rigidMovementAppliedMask);
+                                  if (!movementMask.iszero()) {
+                                      for (var j = 0; j < lvl.layerCount; j++) {
+                                          var layerSection = movementMask.getshiftor(0x1f, 5 * j);
+                                          if (layerSection !== 0) {
+                                              var rigidGroupIndexMask = lvl.rigidGroupIndexMask[i];
+                                              var rigidGroupIndex = rigidGroupIndexMask.getshiftor(0x1f, 5 * j);
+                                              rigidGroupIndex--;
+                                              var groupIndex = state.rigidGroupIndex_to_GroupIndex[rigidGroupIndex];
+                                              bannedGroup[groupIndex] = true;
+                                              doUndo = true;
+                                              break;
+                                          }
+                                      }
+                                  }
+                              }
+                              for (var j = 0; j < state.sfx_MovementFailureMasks.length; j++) {
+                                  var o = state.sfx_MovementFailureMasks[j];
+                                  var objectMask = o.objectMask;
+                                  if (objectMask.anyBitsInCommon(cellMask)) {
+                                      var directionMask = o.directionMask;
+                                      if (movementMask.anyBitsInCommon(directionMask) && seedsToPlay_CantMove.indexOf(o.seed) === -1) {
+                                          seedsToPlay_CantMove.push(o.seed);
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                      lvl.movements.fill(0);
+                      var a = lvl.rigidGroupIndexMask, b = lvl.rigidMovementAppliedMask;
+                      if (a.length !== n) a.length = n;
+                      if (b.length !== n) b.length = n;
+                      a.fill(0);
+                      b.fill(0);
+                      return doUndo;
+                  };
+
+                  applyRules = function (rules, loopPoint, startRuleGroupindex, bannedGroup) {
+                      var pp = getPlayerPositions();
+                      var radius = state.metadata.local_radius === undefined ? -1 : parseInt(state.metadata.local_radius);
+                      if (isNaN(radius)) radius = -1;
+                      bindAll(pp.length ? pp[0] : -1, radius);
+                      return origApplyRules(rules, loopPoint, startRuleGroupindex, bannedGroup);
+                  };
+              })();
+          }
+          '''
+
+          NCPP = "src/native_rules.cpp"
+          open(NCPP, "w", encoding="utf-8", newline="").write(NATIVE_CPP)
+
+          if "namespace nativerules" not in j:
+              j = read_lf(JSCPP)
+              j = replace_once(j, "namespace js {",
+                               "namespace nativerules {\nvoid register_functions(JSContext *ctx, JSValue global_obj);\n}\n\nnamespace js {",
+                               "js.cpp namespace anchor")
+              j = replace_once(j, '    JS_SetPropertyStr(qjs_ctx, global_obj, "native_sleep"',
+                               '    nativerules::register_functions(qjs_ctx, global_obj);\n'
+                               '    JS_SetPropertyStr(qjs_ctx, global_obj, "native_sleep"',
+                               "js.cpp registration anchor")
+              open(JSCPP, "w", encoding="utf-8", newline="").write(j)
+
+          OVERLOAD = "data/custom/overload.js"
+          o = read_lf(OVERLOAD)
+          if "native_bind_level" not in o:
+              o = o.replace("verbose_logging = true;", "verbose_logging = false;")
+              o = o.rstrip("\n") + "\n" + NATIVE_JS
+              open(OVERLOAD, "w", encoding="utf-8", newline="").write(o)
+              print("  overload.js: native hooks added")
+          h = open(HEADER, encoding="latin1").read()
+          h = swap(h, "___data_custom_overload_js", o.encode("utf-8"))
+          open(HEADER, "w", encoding="latin1", newline="").write(h)
+          print("  native_rules.cpp written (%d bytes)" % len(NATIVE_CPP))
 
           print("update_engine: done")
           PYEOF
