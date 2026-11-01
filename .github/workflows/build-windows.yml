@@ -149,6 +149,22 @@ jobs:
                   "setup.js window stubs")
               open(SETUP, "w", encoding="utf-8", newline="").write(s)
 
+          # Path/clip calls used by smoothscreen (and a few other Plus features) have no native equivalent;
+          # make them harmless no-ops instead of "not a function" errors.
+          if "pz_noop_canvas_calls" not in s:
+              s = replace_once(
+                  s,
+                  "\t};\n\treturn context;\n}",
+                  "\t};\n"
+                  "\t// pz_noop_canvas_calls\n"
+                  "\t['save', 'restore', 'beginPath', 'closePath', 'moveTo', 'lineTo', 'clip', 'rect', 'arc', 'stroke', 'fill',\n"
+                  "\t 'strokeRect', 'setLineDash', 'translate', 'scale', 'rotate', 'fillText', 'strokeText'].forEach(function (name) {\n"
+                  "\t\tif (context[name] === undefined) { context[name] = function () {}; }\n"
+                  "\t});\n"
+                  "\treturn context;\n}",
+                  "setup.js canvas no-op calls")
+              open(SETUP, "w", encoding="utf-8", newline="").write(s)
+
 
           # ---- 3. header --------------------------------------------------------------
           def xxd(name, data):
