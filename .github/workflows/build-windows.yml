@@ -1,7 +1,9 @@
 name: Build Windows core
 
-# Builds puzzlescript_libretro.dll with the bundled PuzzleScript Plus engine
-# refreshed to the current upstream (includes release 1740).
+# Builds puzzlescript_libretro.dll with:
+#  - the bundled PuzzleScript Plus engine refreshed to current upstream (includes release 1740)
+#  - a rendering fix: the CSS color "transparent" is skipped instead of drawn as black
+#    (fixes the black squares where the player and crates should be).
 
 on:
   workflow_dispatch:
@@ -60,6 +62,9 @@ jobs:
             2. Adds a no-op window.requestAnimationFrame to data/custom/setup.js
                (newer Plus calls it at load; the core drives its own loop).
             3. Rewrites the matching byte arrays in src/precompiled_bundled.h.
+            4. Fixes src/js.cpp so the CSS color "transparent" (and #RRGGBBAA/#RGBA colors with
+               alpha < 128) is skipped instead of being drawn as opaque black. Without this,
+               every transparent sprite pixel (player, crates, ...) shows up as a black square.
           """
           import re
           import sys
@@ -157,6 +162,47 @@ jobs:
               print(f"  {f}.js -> {len(data)} bytes")
           h = swap(h, "___data_custom_setup_js", s.encode("utf-8"))
           open(HEADER, "w", encoding="latin1", newline="").write(h)
+
+          # ---- 4. js.cpp: transparent colors -------------------------------------------
+          JSCPP = "src/js.cpp"
+          j = read_lf(JSCPP)
+          if "color_is_transparent" not in j:
+              j = replace_once(j, "    if (hexcolor.size() == 4) {",
+                               "    if (hexcolor.size() == 4 || hexcolor.size() == 5) {",
+                               "webcolor #RGBA")
+              helper = (
+                  "// True for the CSS keyword \"transparent\" and for \"#RRGGBBAA\" / \"#RGBA\" colors that are\n"
+                  "// (nearly) fully transparent. The core has no alpha channel, so such fills must be\n"
+                  "// skipped instead of being drawn as opaque black.\n"
+                  "static bool color_is_transparent(const std::string &c)\n"
+                  "{\n"
+                  "    if (c == \"transparent\") {\n"
+                  "        return true;\n"
+                  "    }\n"
+                  "    unsigned alpha = 255;\n"
+                  "    try {\n"
+                  "        if (c.size() == 9) {\n"
+                  "            alpha = static_cast<unsigned>(std::stoul(c.substr(7, 2), nullptr, 16));\n"
+                  "        } else if (c.size() == 5) {\n"
+                  "            alpha = static_cast<unsigned>(std::stoul(c.substr(4, 1), nullptr, 16)) * 17;\n"
+                  "        }\n"
+                  "    } catch (...) {\n"
+                  "        return false;\n"
+                  "    }\n"
+                  "    return alpha < 128;\n"
+                  "}\n\n"
+              )
+              j = replace_once(j, "JSValue js_sprite_add(", helper + "JSValue js_sprite_add(",
+                               "js_sprite_add anchor")
+              j = replace_once(
+                  j,
+                  "    uint16_t color{webcolor(fill)};\n    sprite::fill_rect(id, x, y, w, h, color);",
+                  "    if (color_is_transparent(fill)) {\n        return JS_UNDEFINED;\n    }\n"
+                  "    uint16_t color{webcolor(fill)};\n    sprite::fill_rect(id, x, y, w, h, color);",
+                  "js_fill_rect")
+              open(JSCPP, "w", encoding="utf-8", newline="").write(j)
+              print("  js.cpp: transparent-color fix applied")
+
           print("update_engine: done")
           PYEOF
           python3 update_engine.py
