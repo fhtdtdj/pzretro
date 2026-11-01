@@ -1,5 +1,8 @@
 name: Build Windows core
 
+# Builds puzzlescript_libretro.dll with the bundled PuzzleScript Plus engine
+# refreshed to the current upstream (includes release 1740).
+
 on:
   workflow_dispatch:
   push:
@@ -8,6 +11,16 @@ on:
 
 jobs:
   build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: msvcrt
+            msystem: MINGW64
+            gcc: mingw-w64-x86_64-gcc
+          - name: ucrt
+            msystem: UCRT64
+            gcc: mingw-w64-ucrt-x86_64-gcc
     runs-on: windows-latest
     defaults:
       run:
@@ -19,18 +32,134 @@ jobs:
 
       - uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
+          msystem: ${{ matrix.msystem }}
           update: true
           install: >-
             git
             make
-            mingw-w64-x86_64-gcc
+            python
+            ${{ matrix.gcc }}
 
       - name: Fetch submodules
-        run: git submodule update --init --depth 1 src/libretro src/quickjs-ng
+        run: git submodule update --init --depth 1 src/libretro src/quickjs-ng data/PuzzleScriptPlus
 
       - name: Patch Makefile.common
         run: sed -i 's/-lpthread -ldl/-lpthread/' Makefile.common
+
+      - name: Update bundled PuzzleScript Plus engine
+        run: |
+          cat > update_engine.py <<'PYEOF'
+          #!/usr/bin/env python3
+          """Refresh pzretro's bundled PuzzleScript Plus engine from data/PuzzleScriptPlus.
+
+          Run from the pzretro repo root after:
+              git submodule update --init data/PuzzleScriptPlus
+
+          What it does:
+            1. Re-applies the core author's anti-aliased-font edits to Plus graphics.js.
+            2. Adds a no-op window.requestAnimationFrame to data/custom/setup.js
+               (newer Plus calls it at load; the core drives its own loop).
+            3. Rewrites the matching byte arrays in src/precompiled_bundled.h.
+          """
+          import re
+          import sys
+
+          PLUS = "data/PuzzleScriptPlus/src/js/"
+          HEADER = "src/precompiled_bundled.h"
+          SETUP = "data/custom/setup.js"
+          FILES = ["colors", "compiler", "engine", "globalVariables",
+                   "graphics", "inputoutput", "parser"]
+
+
+          def replace_once(text, old, new, what):
+              if text.count(old) != 1:
+                  sys.exit(f"update_engine: cannot find unique anchor for {what}")
+              return text.replace(old, new, 1)
+
+
+          # ---- 1. graphics.js ---------------------------------------------------------
+          def read_lf(path):
+              return open(path, "rb").read().replace(b"\r\n", b"\n").decode("utf-8")
+
+
+          g = read_lf(PLUS + "graphics.js")
+
+          interp = (
+              "function interpolate_color(left, right, alpha) {\n"
+              "    let leftrgb = /^#?([a-f\\d]{2})([a-f\\d]{2})([a-f\\d]{2})$/i.exec(left);\n"
+              "    let rightrgb = /^#?([a-f\\d]{2})([a-f\\d]{2})([a-f\\d]{2})$/i.exec(right);\n"
+              "    var result = [0, 0, 0];\n"
+              "    for (var i = 0; i < 3; i++) {\n"
+              "        result[i] = Math.round(parseInt(leftrgb[i + 1], 16) + alpha * (parseInt(rightrgb[i + 1], 16) - parseInt(leftrgb[i + 1], 16)));\n"
+              "    }\n"
+              "    return \"#\" + ((1 << 24) + (result[0] << 16) + (result[1] << 8) + result[2]).toString(16).slice(1);\n"
+              "}\n\n"
+          )
+          palette = (
+              "colors = [\n"
+              "            state.bgcolor,\n"
+              "            state.fgcolor,\n"
+              "            interpolate_color(state.bgcolor, state.fgcolor, 0.25),\n"
+              "            interpolate_color(state.bgcolor, state.fgcolor, 0.5),\n"
+              "            interpolate_color(state.bgcolor, state.fgcolor, 0.75),\n"
+              "        ];"
+          )
+
+          g = replace_once(g, "function createSprite(name,spritegrid, colors, padding) {",
+                           interp + "function createSprite(name,spritegrid, colors, padding) {",
+                           "createSprite")
+          g = replace_once(g, "\t\tcolors = [state.bgcolor, state.fgcolor];", "        " + palette,
+                           "createSprite palette")
+          g = replace_once(g, "colors = ['#00000000', state.fgcolor];", palette,
+                           "renderSprite palette")
+          g = replace_once(
+              g,
+              "        w=5 + 1;\n        h=font['X'].length/(w) + 1;\n",
+              "        var xchar = font['X'].split('\\n').map(a=>a.trim());\n"
+              "        w = xchar[1].length + 1;\n"
+              "        h = xchar.length;\n",
+              "textMode glyph size")
+
+          # ---- 2. setup.js ------------------------------------------------------------
+          s = read_lf(SETUP)
+          if "requestAnimationFrame" not in s:
+              anchor = "window.addEventListener = function(type, listener, useCapture) {};\n"
+              s = replace_once(
+                  s, anchor,
+                  anchor +
+                  "// Newer PuzzleScript Plus calls this at load; the core drives its own main loop, so it is a no-op.\n"
+                  "var requestAnimationFrame = window.requestAnimationFrame = function (callback) {};\n",
+                  "setup.js window stubs")
+              open(SETUP, "w", encoding="utf-8", newline="").write(s)
+
+
+          # ---- 3. header --------------------------------------------------------------
+          def xxd(name, data):
+              rows = [", ".join("0x%02x" % b for b in data[i:i + 12])
+                      for i in range(0, len(data), 12)]
+              return (f"unsigned char {name}[] = {{\n" +
+                      ",\n".join("  " + r for r in rows) +
+                      f"\n}};\nunsigned int {name}_len = {len(data)};\n")
+
+
+          def swap(header, name, data):
+              pat = re.compile(r"unsigned char " + name + r"\[\] = \{.*?\};\nunsigned int " +
+                               name + r"_len = \d+;\n", re.S)
+              if len(pat.findall(header)) != 1:
+                  sys.exit(f"update_engine: {name} not found exactly once in header")
+              return pat.sub(lambda m: xxd(name, data), header)
+
+
+          h = open(HEADER, encoding="latin1").read()
+          for f in FILES:
+              data = read_lf(PLUS + f + ".js").encode("utf-8") if f != "graphics" else g.encode("utf-8")
+              h = swap(h, f"___data_PuzzleScriptPlus_src_js_{f}_js", data)
+              print(f"  {f}.js -> {len(data)} bytes")
+          h = swap(h, "___data_custom_setup_js", s.encode("utf-8"))
+          open(HEADER, "w", encoding="latin1", newline="").write(h)
+          print("update_engine: done")
+          PYEOF
+          python3 update_engine.py
 
       - name: Build
         run: make platform=win LIBS="-static" -j"$(nproc)"
@@ -43,7 +172,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: puzzlescript-libretro-windows-x64
+          name: puzzlescript-libretro-windows-${{ matrix.name }}
           path: |
             puzzlescript_libretro.dll
             puzzlescript_libretro.info
