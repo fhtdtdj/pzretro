@@ -3,7 +3,8 @@ name: Build Windows core
 # Builds puzzlescript_libretro.dll with:
 #  - the bundled PuzzleScript Plus engine refreshed to current upstream (includes release 1740)
 #  - a rendering fix: the CSS color "transparent" is skipped instead of drawn as black
-#    (fixes the black squares where the player and crates should be).
+#    (fixes the black squares where the player and crates should be)
+#  - working save states for big games: 4 MB state limit and fast loading
 
 on:
   workflow_dispatch:
@@ -65,6 +66,11 @@ jobs:
             4. Fixes src/js.cpp so the CSS color "transparent" (and #RRGGBBAA/#RGBA colors with
                alpha < 128) is skipped instead of being drawn as opaque black. Without this,
                every transparent sprite pixel (player, crates, ...) shows up as a black square.
+            5. Makes loading a save state fast on games that use run_rules_on_level_start: the
+               whole-map start-up pass is skipped while loading, because the saved state already
+               contains its result. (On Enigmash loading a state drops from ~17 s to ~0.5 s.)
+            6. Raises the maximum save-state size from 1 MB to 4 MB in src/core.cpp. Enigmash's
+               state is about 3 MB, so with the stock 1 MB limit saving it fails.
           """
           import re
           import sys
@@ -202,6 +208,47 @@ jobs:
                   "js_fill_rect")
               open(JSCPP, "w", encoding="utf-8", newline="").write(j)
               print("  js.cpp: transparent-color fix applied")
+
+
+          # ---- 5. main.js: fast save-state loading --------------------------------------
+          MAINJS = "data/custom/main.js"
+          m = read_lf(MAINJS)
+          if "hide_start_rules" not in m:
+              m = replace_once(
+                  m,
+                  "    loadLevelFromState(state, dstate.curlevel);\n",
+                  "    // loadLevelFromState runs the whole-level \"run_rules_on_level_start\" pass, which takes many\n"
+                  "    // seconds on big maps in QuickJS. The saved state already contains its result and is\n"
+                  "    // restored below, so skip that pass while loading. (The engine rebuilds state.metadata from\n"
+                  "    // state.default_metadata when a level loads, so the flag has to be hidden in both.)\n"
+                  "    const hide_start_rules = 'run_rules_on_level_start' in state.default_metadata;\n"
+                  "    const start_rules_value = state.default_metadata.run_rules_on_level_start;\n"
+                  "    if (hide_start_rules) {\n"
+                  "        delete state.default_metadata.run_rules_on_level_start;\n"
+                  "        delete state.metadata.run_rules_on_level_start;\n"
+                  "    }\n"
+                  "    loadLevelFromState(state, dstate.curlevel);\n"
+                  "    if (hide_start_rules) {\n"
+                  "        state.default_metadata.run_rules_on_level_start = start_rules_value;\n"
+                  "        state.metadata.run_rules_on_level_start = start_rules_value;\n"
+                  "    }\n",
+                  "main.js deserialize")
+              open(MAINJS, "w", encoding="utf-8", newline="").write(m)
+              print("  main.js: fast state loading applied")
+          h = open(HEADER, encoding="latin1").read()
+          h = swap(h, "___data_custom_main_js", m.encode("utf-8"))
+          open(HEADER, "w", encoding="latin1", newline="").write(h)
+
+
+          # ---- 6. core.cpp: larger save-state limit -------------------------------------
+          COREPP = "src/core.cpp"
+          c = read_lf(COREPP)
+          if "SERIALIZE_MAX_SIZE{4*1024*1024}" not in c:
+              c = replace_once(c, "constexpr size_t SERIALIZE_MAX_SIZE{1024*1024};",
+                               "constexpr size_t SERIALIZE_MAX_SIZE{4*1024*1024};",
+                               "SERIALIZE_MAX_SIZE")
+              open(COREPP, "w", encoding="utf-8", newline="").write(c)
+              print("  core.cpp: save-state limit raised to 4 MB")
 
           print("update_engine: done")
           PYEOF
