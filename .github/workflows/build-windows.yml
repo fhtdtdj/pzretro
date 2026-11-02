@@ -137,6 +137,50 @@ jobs:
               "        h = xchar.length;\n",
               "textMode glyph size")
 
+          # Renderer speed-up: the stock loops test every object id in every cell (hundreds of thousands of
+          # interpreted iterations per frame on big games). native_present_cells() lists only the objects that
+          # are really there, in exactly the same drawing order.
+          def native_cell_loops(g):
+              pat_a = re.compile(
+                  r"for \(var i = Math\.max\(mini - renderBorderSize, 0\); i < Math\.min\(maxi \+ renderBorderSize, curlevel\.width\); i\+\+\) \{"
+                  r"\s*for \(var j = Math\.max\(minj - renderBorderSize, 0\); j < Math\.min\(maxj \+ renderBorderSize, curlevel\.height\); j\+\+\) \{"
+                  r"\s*var posIndex = j \+ i \* curlevel\.height;"
+                  r"\s*var posMask = curlevel\.getCellInto\(posIndex,_o12\);\s*"
+                  r"for \(var k = 0; k < state\.objectCount; k\+\+\) \{\s*"
+                  r"if \(posMask\.get\(k\) != 0\) \{")
+              pat_b = re.compile(
+                  r"for \(var k = 0; k < state\.idDict\.length; k\+\+\) \{\s*"
+                  r"var object = state\.objects\[state\.idDict\[k\]\];\s*"
+                  r"var layerID = object\.layer;\s*"
+                  r"for \(var i = Math\.max\(mini - renderBorderSize, 0\); i < Math\.min\(maxi \+ renderBorderSize, curlevel\.width\); i\+\+\) \{"
+                  r"\s*for \(var j = Math\.max\(minj - renderBorderSize, 0\); j < Math\.min\(maxj \+ renderBorderSize, curlevel\.height\); j\+\+\) \{"
+                  r"\s*var posIndex = j \+ i \* curlevel\.height;"
+                  r"\s*var posMask = curlevel\.getCellInto\(posIndex,_o12\);\s*"
+                  r"if \(posMask\.get\(k\) != 0\) \{")
+              rng = ("native_present_cells(curlevel.objects, STRIDE_OBJ, state.objectCount, "
+                     "Math.max(mini - renderBorderSize, 0), Math.min(maxi + renderBorderSize, curlevel.width), "
+                     "Math.max(minj - renderBorderSize, 0), Math.min(maxj + renderBorderSize, curlevel.height), curlevel.height, %d)")
+              def rep_a(m):
+                  opens = m.group(0).count("{")
+                  return ("var __cells = " + (rng % 0) + ";\n"
+                          "for (var __q = 0; __q < __cells.length; __q += 3) { var i = __cells[__q], j = __cells[__q + 1], k = __cells[__q + 2];\n"
+                          "var posIndex = j + i * curlevel.height;\n" + "{ " * (opens - 1))
+              def rep_b(m):
+                  opens = m.group(0).count("{")
+                  return ("var __cells = " + (rng % 1) + ";\n"
+                          "for (var __q = 0; __q < __cells.length; __q += 3) { var i = __cells[__q], j = __cells[__q + 1], k = __cells[__q + 2];\n"
+                          "var object = state.objects[state.idDict[k]]; var layerID = object.layer;\n"
+                          "var posIndex = j + i * curlevel.height;\n" + "{ " * (opens - 1))
+              for pat, rep, what in ((pat_a, rep_a, "plain draw loop"), (pat_b, rep_b, "tween draw loop")):
+                  found = pat.findall(g)
+                  if len(found) != 1:
+                      sys.exit("update_engine: cannot find unique anchor for " + what)
+                  g = pat.sub(rep, g, count=1)
+              return g
+
+
+          g = native_cell_loops(g)
+
           # ---- 2. setup.js ------------------------------------------------------------
           s = read_lf(SETUP)
           if "requestAnimationFrame" not in s:
@@ -723,12 +767,54 @@ jobs:
               return result;
           }
 
+          // native_present_cells(objects, strideObj, objectCount, imin, imax, jmin, jmax, height, mode)
+          //   -> flat [i, j, k, i, j, k, ...] for every (cell, object) pair where the object is present.
+          // mode 0: ordered by cell (i, then j) then object k; mode 1: ordered by k, then i, then j.
+          // This is what the renderer's "for every cell and every object" loops compute, minus the waste.
+          static JSValue js_present_cells(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv)
+          {
+              size_t cnt{0};
+              int32_t *obj = argc > 8 ? ta(ctx, argv[0], &cnt) : nullptr;
+              int32_t v[8] = {0};
+              for (int a = 1; a < 9 && argc > 8; ++a) {
+                  JS_ToInt32(ctx, &v[a - 1], argv[a]);
+              }
+              const int32_t so = v[0], nobj = v[1], imin = v[2], imax = v[3], jmin = v[4], jmax = v[5], h = v[6], mode = v[7];
+              if (!obj || so < 1 || nobj < 0 || nobj > so * 32 || h < 1 || imin < 0 || jmin < 0 ||
+                  (imax > imin && jmax > jmin && (size_t)((size_t)(imax - 1) * h + (jmax - 1) + 1) * so > cnt)) {
+                  return JS_ThrowTypeError(ctx, "native_present_cells: bad arguments");
+              }
+              JSValue result = JS_NewArray(ctx);
+              uint32_t n{0};
+              auto emit = [&](int32_t i, int32_t j, int32_t k) {
+                  JS_SetPropertyUint32(ctx, result, n++, JS_NewInt32(ctx, i));
+                  JS_SetPropertyUint32(ctx, result, n++, JS_NewInt32(ctx, j));
+                  JS_SetPropertyUint32(ctx, result, n++, JS_NewInt32(ctx, k));
+              };
+              auto has = [&](int32_t i, int32_t j, int32_t k) {
+                  return ((obj[((size_t)j + (size_t)i * h) * so + (k >> 5)] >> (k & 31)) & 1) != 0;
+              };
+              if (mode == 0) {
+                  for (int32_t i = imin; i < imax; ++i)
+                      for (int32_t j = jmin; j < jmax; ++j)
+                          for (int32_t k = 0; k < nobj; ++k)
+                              if (has(i, j, k)) emit(i, j, k);
+              } else {
+                  for (int32_t k = 0; k < nobj; ++k)
+                      for (int32_t i = imin; i < imax; ++i)
+                          for (int32_t j = jmin; j < jmax; ++j)
+                              if (has(i, j, k)) emit(i, j, k);
+              }
+              return result;
+          }
+
           void register_functions(JSContext *ctx, JSValue global_obj)
           {
               JS_SetPropertyStr(ctx, global_obj, "native_rule_compile", JS_NewCFunction(ctx, js_compile, "native_rule_compile", 1));
               JS_SetPropertyStr(ctx, global_obj, "native_bind_level", JS_NewCFunction(ctx, js_bind, "native_bind_level", 16));
               JS_SetPropertyStr(ctx, global_obj, "native_player_positions", JS_NewCFunction(ctx, js_player_positions, "native_player_positions", 4));
               JS_SetPropertyStr(ctx, global_obj, "native_calc_masks", JS_NewCFunction(ctx, js_calc_masks, "native_calc_masks", 0));
+              JS_SetPropertyStr(ctx, global_obj, "native_present_cells", JS_NewCFunction(ctx, js_present_cells, "native_present_cells", 9));
               JS_SetPropertyStr(ctx, global_obj, "native_nonzero_tiles", JS_NewCFunction(ctx, js_nonzero, "native_nonzero_tiles", 3));
               JS_SetPropertyStr(ctx, global_obj, "native_try_apply", JS_NewCFunction(ctx, js_try_apply, "native_try_apply", 1));
           }
