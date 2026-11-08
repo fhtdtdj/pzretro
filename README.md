@@ -1,5 +1,40 @@
 # PuzzleScript Retroarch Core
 
+## Windows build and speed-ups (this fork)
+
+This fork adds a Windows build and a number of fixes, mainly so large PuzzleScript Plus games run well.
+
+**Download:** open the *Releases* page of this repository and get `puzzlescript-libretro-windows-ucrt.zip`.
+Put `puzzlescript_libretro.dll` in RetroArch's `cores` folder and `puzzlescript_libretro.info` in its `info`
+folder, then load a `.pz` or `.pzp` game. The zip is rebuilt by GitHub Actions
+(`.github/workflows/build-windows.yml`) from the sources here. If the DLL does not load, the workflow also
+builds an older-runtime `msvcrt` variant, available as a build artifact on the Actions page.
+
+What is different from the original core:
+
+* Made for Windows
+* Bundled engine updated to the current PuzzleScript Plus (release 1740 and later).
+* Transparent colors are no longer drawn as black squares (this fixed missing players and crates in some games).
+* Save states work for big games: the state size limit is 4 MB, and loading a state skips the slow
+  whole-level start-up pass.
+* Much faster moves on big games: the engine's hot loops (rule matching and application, row/column masks,
+  player search, movement resolution, and drawing) run as native C++ in `src/native_rules.cpp`. Rules the
+  native code cannot handle (ellipsis, rigid, random) fall back to the original JavaScript. On Enigmash a move
+  went from about 1 s to about 65 ms.
+* Games using `smoothscreen` and `custom_font` no longer hit errors or black text screens. Custom fonts are
+  not loaded; the built-in font is used instead.
+
+Notes: `.pzp` files always use the PuzzleScript Plus engine.
+
+---
+
+> **Everything below this line is the original project's README**, by its original author. Many thanks to them
+> for creating the core. Some of it was written for Linux and does not apply to this Windows build (for
+> example the build and install instructions, and any mention of `.so` files or Linux tools); skip those parts.
+> The sections on the controls, `.pz`/`.pzp` games and save states still apply.
+
+---
+
 ![Gameplay screen of Pot Wash Panic](doc/potwashpanic_gameplay.png)
 
 This is a libretro core that plays PuzzleScript games.
