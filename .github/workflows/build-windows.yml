@@ -6,6 +6,9 @@ name: Build Windows core
 #    (fixes the black squares where the player and crates should be)
 #  - working save states for big games: 4 MB state limit and fast loading
 #  - speed: native C++ versions of the engine's hot loops (about 15x faster moves on big games)
+#  - faster drawing: only objects that are really in a cell are drawn (big win on tweened/animated games)
+#  - missing browser calls stubbed: canvas path/clip calls (smoothscreen) and FontFace (custom_font),
+#    which fixes black text screens and "not a function" errors in games like Reliquia Park
 
 on:
   workflow_dispatch:
@@ -191,6 +194,20 @@ jobs:
                   "// Newer PuzzleScript Plus calls this at load; the core drives its own main loop, so it is a no-op.\n"
                   "var requestAnimationFrame = window.requestAnimationFrame = function (callback) {};\n",
                   "setup.js window stubs")
+              open(SETUP, "w", encoding="utf-8", newline="").write(s)
+
+          # Games with custom_font (e.g. Reliquia Park) call FontFace at compile time; without it the engine
+          # throws and text screens come out black. The core cannot load web fonts, so provide a FontFace whose
+          # load() never completes: the engine then keeps using its built-in bitmap font for text.
+          if "pz_fontface_stub" not in s:
+              s = replace_once(
+                  s,
+                  "var document={};\n",
+                  "var document={};\n"
+                  "// pz_fontface_stub\n"
+                  "var FontFace = function (family, source) { this.family = family; this.load = function () { return new Promise(function () {}); }; };\n"
+                  "document.fonts = { add: function () {} };\n",
+                  "setup.js FontFace stub")
               open(SETUP, "w", encoding="utf-8", newline="").write(s)
 
           # Path/clip calls used by smoothscreen (and a few other Plus features) have no native equivalent;
