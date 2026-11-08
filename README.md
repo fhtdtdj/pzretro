@@ -12,7 +12,7 @@ builds an older-runtime `msvcrt` variant, available as a build artifact on the A
 
 What is different from the original core:
 
-* Made for Windows
+* Made for Windows.
 * Bundled engine updated to the current PuzzleScript Plus (release 1740 and later).
 * Transparent colors are no longer drawn as black squares (this fixed missing players and crates in some games).
 * Save states work for big games: the state size limit is 4 MB, and loading a state skips the slow
