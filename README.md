@@ -5,10 +5,7 @@
 This fork adds a Windows build and a number of fixes, mainly so large PuzzleScript Plus games run well.
 
 **Download:** open the *Releases* page of this repository and get `puzzlescript-libretro-windows-ucrt.zip`.
-Put `puzzlescript_libretro.dll` in RetroArch's `cores` folder and `puzzlescript_libretro.info` in its `info`
-folder, then load a `.pz` or `.pzp` game. The zip is rebuilt by GitHub Actions
-(`.github/workflows/build-windows.yml`) from the sources here. If the DLL does not load, the workflow also
-builds an older-runtime `msvcrt` variant, available as a build artifact on the Actions page.
+Put `puzzlescript_libretro.dll` in RetroArch's `cores` folder, then load a `.pz` or `.pzp` game.
 
 What is different from the original core:
 
