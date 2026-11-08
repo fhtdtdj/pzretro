@@ -32,10 +32,10 @@ Notes: `.pzp` files always use the PuzzleScript Plus engine.
 [Claude](https://claude.ai) (an AI assistant made by Anthropic), directed and tested by the repository owner.
 The code has not been through a human code review, so treat it as experimental. Bug reports are welcome.
 
-> **Everything below this line is the original project's README**, by its original author. Many thanks to them
-> for creating the core. Some of it was written for Linux and does not apply to this Windows build (for
-> example the build and install instructions, and any mention of `.so` files or Linux tools); skip those parts.
-> The sections on the controls, `.pz`/`.pzp` games and save states still apply.
+**Everything below this line is the original project's README**, by its original author. Many thanks to them
+for creating the core. Some of it was written for Linux and does not apply to this Windows build (for
+example the build and install instructions, and any mention of `.so` files or Linux tools); skip those parts.
+The sections on the controls, `.pz`/`.pzp` games and save states still apply.
 
 ---
 
